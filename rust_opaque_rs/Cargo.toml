@@ -1,0 +1,16 @@
+[package]
+name = "opaque_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "opaque_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+opaque-ke = { version = "4.0.1", features = ["argon2", "ristretto255"] }
+rand = "0.8"
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = "1.7"
