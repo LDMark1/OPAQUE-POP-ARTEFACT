@@ -1,13 +1,35 @@
 import base64
 import hashlib
 import hmac
+import os
+from pathlib import Path
 import secrets
+import sys
 import time
 
 import httpx
 import opaque_rs
 
-SERVER = "http://127.0.0.1:8000"
+SERVER = os.getenv("SERVER_URL", "https://localhost:8000")
+DEFAULT_CA = Path(__file__).resolve().parents[1] / "certs" / "localhost.crt"
+
+def tls_verify_config():
+    # Allow custom CA bundle or (explicit) local dev opt-out.
+    ca_bundle = os.getenv("TLS_CA_BUNDLE")
+    if ca_bundle:
+        return ca_bundle
+    if DEFAULT_CA.exists():
+        # print("RETURNED DEFAULT CA:", DEFAULT_CA, file=sys.stderr, flush=True)
+        return str(DEFAULT_CA)
+    if os.getenv("TLS_SKIP_VERIFY", "").lower() in {"1", "true", "yes"}:
+        return False
+    msg = (
+        "TLS verification requires a CA bundle. "
+        f"Expected {DEFAULT_CA} to exist, or set TLS_CA_BUNDLE, "
+        "or (unsafe) set TLS_SKIP_VERIFY=1 for local dev."
+    )
+    print(msg, file=sys.stderr)
+    raise RuntimeError(msg)
 
 def b64e(b: bytes) -> str:
     # Encode bytes to base64 ASCII for PoP header transport.
@@ -49,7 +71,7 @@ def main():
     username = "alice@example.com"
     password = b"correct horse battery staple"
 
-    with httpx.Client() as c:
+    with httpx.Client(verify=tls_verify_config()) as c:
         # -----------------------
         # REGISTRATION (real OPAQUE)
         # -----------------------

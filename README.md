@@ -69,8 +69,13 @@ This project is a minimal end-to-end prototype that combines OPAQUE password-aut
    - `pip install -r server/requirements.txt`
    - `pip install httpx`
 
-3) Start the API server (from repo root):
-   - `uvicorn server.app:app --reload`
+3) Generate a local TLS cert (from repo root):
+   - `mkdir -p certs`
+   - `openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes -keyout certs/localhost.key -out certs/localhost.crt -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`
 
-4) Run the client demo (in a second terminal):
+4) Start the API server with TLS (from repo root):
+   - `uvicorn server.app:app --reload --ssl-keyfile certs/localhost.key --ssl-certfile certs/localhost.crt`
+
+
+5) Run the client demo (in a second terminal):
    - `python client/client_demo.py`
