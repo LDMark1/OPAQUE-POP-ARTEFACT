@@ -4,3 +4,8 @@ __pycache__/
 .venv/
 Cargo.lock
 certs/
+
+# Ignore local TLS certs
+certs/*.key
+certs/*.crt
+certs/*.pem
