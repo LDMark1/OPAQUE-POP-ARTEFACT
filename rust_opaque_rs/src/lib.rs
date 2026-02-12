@@ -18,8 +18,7 @@ use sha2::Sha512;
 /// - OPRF group: Ristretto255
 /// - AKE: TripleDH over Ristretto255 with Sha512
 /// - KSF: Argon2 (enabled via opaque-ke "argon2" feature)
-///
-/// opaque-ke docs show using argon2::Argon2<'static> for Ksf. :contentReference[oaicite:2]{index=2}
+
 struct OpaqueSuite;
 
 impl CipherSuite for OpaqueSuite {

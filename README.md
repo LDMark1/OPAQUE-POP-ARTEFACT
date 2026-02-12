@@ -51,7 +51,6 @@ This project is a minimal end-to-end prototype that combines OPAQUE password-aut
 
 - PoP MACs bind the request body, method, path, timestamp, and nonce.
 - Nonce tracking plus a time window mitigates replay.
-- Threat model reference: `threatmodel.md`.
 
 ## Project Structure
 
