@@ -1,191 +1,80 @@
-import base64
-import hashlib
-import hmac
+"""Run from the repository root: python -m client.client_demo."""
 import os
 from pathlib import Path
 import secrets
-import sys
+import ssl
 import time
 
 import httpx
 import opaque_rs
+from server.pop import Session, derive_key, sign
 
-SERVER = os.getenv("SERVER_URL", "https://localhost:8000")
-DEFAULT_CA = Path(__file__).resolve().parents[1] / "certs" / "localhost.crt"
+SERVER = os.getenv('SERVER_URL', 'https://localhost:8000').rstrip('/')
+
 
 def tls_verify_config():
-    # Allow custom CA bundle or (explicit) local dev opt-out.
-    ca_bundle = os.getenv("TLS_CA_BUNDLE")
-    if ca_bundle:
-        return ca_bundle
-    if DEFAULT_CA.exists():
-        # print("RETURNED DEFAULT CA:", DEFAULT_CA, file=sys.stderr, flush=True)
-        return str(DEFAULT_CA)
-    if os.getenv("TLS_SKIP_VERIFY", "").lower() in {"1", "true", "yes"}:
-        return False
-    msg = (
-        "TLS verification requires a CA bundle. "
-        f"Expected {DEFAULT_CA} to exist, or set TLS_CA_BUNDLE, "
-        "or (unsafe) set TLS_SKIP_VERIFY=1 for local dev."
-    )
-    print(msg, file=sys.stderr)
-    raise RuntimeError(msg)
+    ca = os.getenv('TLS_CA_BUNDLE', str(Path(__file__).resolve().parents[1] / 'certs/localhost.crt'))
+    return ssl.create_default_context(cafile=ca)
 
-def b64e(b: bytes) -> str:
-    # Encode bytes to base64 ASCII for PoP header transport.
-    return base64.b64encode(b).decode("ascii")
 
-def canonical_request(method: str, path: str, body_bytes: bytes, ts: str, nonce: str) -> bytes:
-    # Canonicalize request fields so client/server MACs match.
-    body_hash_hex = hashlib.sha256(body_bytes).hexdigest()
-    return f"{method}\n{path}\n{body_hash_hex}\n{ts}\n{nonce}".encode("utf-8")
+def register(client, username, password):
+    state, request = opaque_rs.client_registration_start(password)
+    response = client.post('/register/start', json={'username': username, 'reg_request_hex': bytes(request).hex()})
+    response.raise_for_status()
+    upload, _ = opaque_rs.client_registration_finish(state, password, bytes.fromhex(response.json()['reg_response_hex']))
+    result = client.post('/register/finish', json={
+        'registration_id': response.json()['registration_id'], 'reg_upload_hex': bytes(upload).hex()})
+    result.raise_for_status()
 
-def make_pop(session_key: bytes, method: str, path: str, body_bytes: bytes, ts: str, nonce: str) -> str:
-    # Compute a PoP MAC over the canonical request.
-    msg = canonical_request(method, path, body_bytes, ts, nonce)
-    mac = hmac.new(session_key, msg, hashlib.sha256).digest()
-    return b64e(mac)
 
-def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
-    # HKDF extract step to derive a pseudorandom key.
-    return hmac.new(salt, ikm, hashlib.sha256).digest()
+def login(client, username, password):
+    state, request = opaque_rs.client_login_start(password)
+    response = client.post('/login/start', json={'username': username, 'cred_request_hex': bytes(request).hex()})
+    response.raise_for_status()
+    final, key, _ = opaque_rs.client_login_finish(state, password, bytes.fromhex(response.json()['cred_response_hex']))
+    result = client.post('/login/finish', json={'login_id': response.json()['login_id'], 'cred_final_hex': bytes(final).hex()})
+    result.raise_for_status()
+    data = result.json()
+    origin = str(client.base_url).rstrip('/')
+    if data['origin'] != origin:
+        raise ValueError('unexpected server origin')
+    return Session(data['session_id'], origin, derive_key(bytes(key), origin, data['session_id'], username),
+                   data['expires_at'], username=username)
 
-def hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
-    # HKDF expand step to produce a fixed-length key.
-    t = b""
-    okm = b""
-    counter = 1
-    while len(okm) < length:
-        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
-        okm += t
-        counter += 1
-    return okm[:length]
 
-def derive_pop_key(session_key: bytes) -> bytes:
-    # Derive a PoP-only MAC key from the OPAQUE session key.
-    prk = hkdf_extract(b"opaque-pop-salt-v1", session_key)
-    return hkdf_expand(prk, b"OPAQUE-POP-MAC-v1", 32)
+def signed_request(client, session, path, *, payload=None, now=None, nonce=None):
+    request = client.build_request('POST', path, json=payload) if payload is not None else client.build_request('POST', path)
+    body = request.read()
+    timestamp = str(int(time.time()) if now is None else now)
+    nonce = nonce or secrets.token_hex(16)
+    target = request.url.raw_path.decode('ascii')  # includes exact query octets
+    proof = sign(session, request.method, target, request.headers.get('content-type', ''), body, timestamp, nonce)
+    request.headers.update({'Authorization': f'Bearer {session.sid}', 'X-TS': timestamp,
+                            'X-NONCE': nonce, 'X-POP': proof})
+    return request
+
 
 def main():
-    # End-to-end demo: register, login, and call a PoP-protected endpoint.
-    username = "alice@example.com"
-    password = b"correct horse battery staple"
-
-    with httpx.Client(verify=tls_verify_config()) as c:
-        # -----------------------
-        # REGISTRATION (real OPAQUE)
-        # -----------------------
-        client_state, reg_request = opaque_rs.client_registration_start(password)
-
-        r1 = c.post(f"{SERVER}/register/start", json={
-            "username": username,
-            "reg_request_hex": reg_request.hex(),
-        })
-        r1.raise_for_status()
-        reg_response = bytes.fromhex(r1.json()["reg_response_hex"])
-
-        reg_upload, export_key_reg = opaque_rs.client_registration_finish(
-            client_state, password, reg_response
-        )
-
-        r2 = c.post(f"{SERVER}/register/finish", json={
-            "username": username,
-            "reg_upload_hex": reg_upload.hex(),
-        })
-        r2.raise_for_status()
-
-        print("[+] Registered")
-        print("    export_key(reg) =", export_key_reg.hex())
-
-        # -----------------------
-        # LOGIN (real OPAQUE)
-        # -----------------------
-        login_state, cred_req = opaque_rs.client_login_start(password)
-
-        l1 = c.post(f"{SERVER}/login/start", json={
-            "username": username,
-            "cred_request_hex": cred_req.hex(),
-        })
-        l1.raise_for_status()
-        server_state = bytes.fromhex(l1.json()["server_state_hex"])
-        cred_resp = bytes.fromhex(l1.json()["cred_response_hex"])
-
-        cred_final, client_session_key, export_key_login = opaque_rs.client_login_finish(
-            login_state, password, cred_resp
-        )
-
-        l2 = c.post(f"{SERVER}/login/finish", json={
-            "username": username,
-            "server_state_hex": server_state.hex(),
-            "cred_final_hex": cred_final.hex(),
-        })
-        l2.raise_for_status()
-        session_id = l2.json()["session_id"]
-
-        print("[+] Logged in")
-        print("    session_id =", session_id)
-        print("    export_key(login) =", export_key_login.hex())
-        print("    session_key(client) =", client_session_key.hex()[:32] + "...")
-
-        # -----------------------
-        # PROTECTED REQUEST with PoP
-        # -----------------------
-        path = "/api/transfer"
-        method = "POST"
-        body = {"amount": 50, "to": "bob@example.com"}
-
-        # Ensure body_bytes exactly matches what is sent
-        req = httpx.Request(method, f"{SERVER}{path}", json=body)
-        body_bytes = req.read()
-
-        ts = str(int(time.time()))
-        nonce = secrets.token_urlsafe(16)
-        pop_key = derive_pop_key(client_session_key)
-        pop = make_pop(pop_key, method, path, body_bytes, ts, nonce)
-
-
-        req.headers.update({
-            "Authorization": f"Bearer {session_id}",
-            "X-TS": ts,
-            "X-NONCE": nonce,
-            "X-POP": pop,
-        })
-
-        ok = c.send(req)
+    if not SERVER.startswith('https://'):
+        raise ValueError('HTTPS is required')
+    # Unique demo identity so repeated runs never overwrite an existing account.
+    username = 'demo-' + secrets.token_hex(8)
+    password = secrets.token_bytes(32)
+    with httpx.Client(base_url=SERVER, verify=tls_verify_config(), trust_env=False) as client:
+        register(client, username, password)
+        session = login(client, username, password)
+        print('Registration and OPAQUE login succeeded (secret values are not logged).')
+        request = signed_request(client, session, '/api/transfer?demo=1', payload={'amount': 50, 'to': 'bob'})
+        ok = client.send(request)
         ok.raise_for_status()
-        print("[+] Protected call OK:", ok.json())
+        replay = client.send(request)
+        assert replay.status_code == 401
+        stolen = client.post('/api/transfer', json={'amount': 50, 'to': 'bob'},
+                             headers={'Authorization': f'Bearer {session.sid}'})
+        assert stolen.status_code == 401
+        client.send(signed_request(client, session, '/session/logout')).raise_for_status()
+        print('Protected call accepted; replay and stolen bearer rejected; logout succeeded.')
 
-         # -----------------------
-        # REPLAY DEMO: resend exact same request + same headers (ts/nonce/pop)
-        # -----------------------
-        replay_req = httpx.Request(method, f"{SERVER}{path}", json=body)
-        replay_req.read()  # ensure body is finalized
-        replay_req.headers.update(req.headers)  # reuse identical PoP headers
-        replay = c.send(replay_req)
-        print("[+] Replay attempt status:", replay.status_code)
-        print("    body:", replay.text)
 
-        # -----------------------
-        # ATTACK DEMO: stolen bearer token only (no session_key)
-        # -----------------------
-        attacker_key = b"\x00" * 32  # wrong key, attacker only has token
-        req2 = httpx.Request(method, f"{SERVER}{path}", json=body)
-        body_bytes2 = req2.read()
-        
-        ts2 = str(int(time.time()))
-        nonce2 = secrets.token_urlsafe(16)
-        pop2 = make_pop(attacker_key, method, path, body_bytes2, ts2, nonce2)
-
-        req2.headers.update({
-            "Authorization": f"Bearer {session_id}",  # stolen token
-            "X-TS": ts2,
-            "X-NONCE": nonce2,
-            "X-POP": pop2,
-        })
-
-        bad = c.send(req2)
-        print("[+] Stolen-token attempt status:", bad.status_code)
-        print("    body:", bad.text)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
