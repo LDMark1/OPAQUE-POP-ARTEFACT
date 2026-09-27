@@ -2,10 +2,14 @@ venv/
 target/
 __pycache__/
 .venv/
-Cargo.lock
 certs/
 
 # Ignore local TLS certs
 certs/*.key
 certs/*.crt
 certs/*.pem
+
+.state/
+dist/
+.pytest_cache/
+*.egg-info/
